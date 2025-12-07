@@ -18,19 +18,27 @@
 #define MAX_TASKS		5
 #define STACK_SIZE		256
 
+enum stat {
+	RTP_STAT_UNUSED,
+	RTP_STAT_READY,
+	RTP_STAT_RUNNING,
+};
+
 struct task {
-	uint32_t	*stack;
-	uint32_t	tick;
+	uint32_t       *stack;
+	uint32_t        tick;
+	enum stat       stat;
 };
 
 typedef void (*taskloop_t)(void);
 
 static struct task task_list[MAX_TASKS];
 static uint32_t task_stacks[MAX_TASKS][STACK_SIZE];
-static uint32_t task_count;
-
 static uint32_t current_task;
 static uint32_t next_task;
+
+void rtp_task_exit(void);
+
 
 void rtp_idle_task(void)
 {
@@ -46,35 +54,34 @@ void rtp_pendsv_call(void)
 	__ISB();
 }
 
-int rtp_stack_init(int task_n, taskloop_t task)
+int rtp_stack_init(int tid, taskloop_t task)
 {
 	uint32_t *stk;
 
-	stk = &task_stacks[task_n][STACK_SIZE];
+	stk = &task_stacks[tid][STACK_SIZE];
 
 	/* fill magic number for a new task at start
 	 * xPSR: set the BIT(24) to indicate a Thumb2 code
-	 * LR: 0xFFFFFFFD is an exception return value, turn cpu to thread-mode
 	 */
-	*(--stk) = BIT(24);			// xPSR
-	*(--stk) = (uint32_t)task;	// PC
-    *(--stk) = 0xFFFFFFFD;		// LR
-    *(--stk) = 0x12121212;		// R12
-    *(--stk) = 0x03030303;		// R3
-    *(--stk) = 0x02020202;		// R2
-    *(--stk) = 0x01010101;		// R1
-    *(--stk) = 0x00000000;		// R0
+	*(--stk) = BIT(24);					// xPSR
+	*(--stk) = (uint32_t) task;			// PC
+    *(--stk) = (uint32_t) rtp_task_exit;// LR
+    *(--stk) = 0x12121212;				// R12
+    *(--stk) = 0x03030303;				// R3
+    *(--stk) = 0x02020202;				// R2
+    *(--stk) = 0x01010101;				// R1
+    *(--stk) = 0x00000000;				// R0
 
-	*(--stk) = 0x11111111;		// R11
-    *(--stk) = 0x10101010;		// R10
-    *(--stk) = 0x09090909;		// R9
-    *(--stk) = 0x08080808;		// R8
-    *(--stk) = 0x07070707;		// R7
-    *(--stk) = 0x06060606;		// R6
-    *(--stk) = 0x05050505;		// R5
-    *(--stk) = 0x04040404;		// R4
+	*(--stk) = 0x11111111;				// R11
+    *(--stk) = 0x10101010;				// R10
+    *(--stk) = 0x09090909;				// R9
+    *(--stk) = 0x08080808;				// R8
+    *(--stk) = 0x07070707;				// R7
+    *(--stk) = 0x06060606;				// R6
+    *(--stk) = 0x05050505;				// R5
+    *(--stk) = 0x04040404;				// R4
 
-	task_list[task_n].stack = stk;
+	task_list[tid].stack = stk;
 	return 0;
 }
 
@@ -86,12 +93,22 @@ int rtp_os_init(void)
 
 int rtp_create_task(taskloop_t task)
 {
-	if (task_count > MAX_TASKS - 1)
+	int free_slot = -1;
+	int i;
+
+	for (i = 0; i < MAX_TASKS; i++) {
+		if (task_list[i].stat != RTP_STAT_UNUSED)
+			continue;
+		free_slot = i;
+		break;
+	}
+
+	if (free_slot < 0)
 		return -1;
 
-	rtp_stack_init(task_count, task);
-	task_list[task_count].tick = 0;
-	task_count ++;
+	rtp_stack_init(free_slot, task);
+	task_list[free_slot].tick = 0;
+	task_list[free_slot].stat = RTP_STAT_READY;
 
 	return 0;
 }
@@ -102,12 +119,13 @@ void rtp_os_schedule(void)
 	uint32_t next = current_task;
 
 	// simpl RR
-	for (i = 0; i < task_count; i++) {
+	for (i = 0; i < MAX_TASKS; i++) {
 		next ++;
-		if (next > task_count - 1)
+		if (next > MAX_TASKS - 1)
 			next = 0;
 
-		if (task_list[next].tick == 0) {
+		if (task_list[next].stat != RTP_STAT_UNUSED &&
+			task_list[next].tick == 0) {
 			next_task = next;
 			return;
 		}
@@ -115,6 +133,31 @@ void rtp_os_schedule(void)
 
 	/* none running, wake idle */
 	next_task = 0;
+}
+
+void rtp_delete_task(int tid)
+{
+	if (tid < 0 || tid > MAX_TASKS - 1)
+		return;
+
+	task_list[tid].stat = RTP_STAT_UNUSED;
+
+	if (tid == current_task) {
+		rtp_os_schedule();
+		rtp_pendsv_call();
+	}
+}
+
+void rtp_task_exit(void)
+{
+	rtp_delete_task(current_task);
+
+	/* If PendSV was preempted by a high-prio interrupt,
+	 * after the interrupt ends, pop {lr} returns to a
+	 * task which has already exist
+	 * it will cause os panic, so the nop loop is nescessry
+	 */
+	while (1) __NOP();
 }
 
 void rtp_mdelay(uint32_t delay)
@@ -131,9 +174,12 @@ void rtp_tick_handler(void)
 {
 	int i;
 
-	for (i = 0; i < task_count; i++) {
-		if (task_list[i].tick > 0)
+	for (i = 0; i < MAX_TASKS; i++) {
+		if (task_list[i].stat != RTP_STAT_UNUSED &&
+			task_list[i].tick > 0) {
+
 			task_list[i].tick --;
+		}
 	}
 	rtp_os_schedule();
 	rtp_pendsv_call();
