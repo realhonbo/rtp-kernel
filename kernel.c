@@ -1,22 +1,18 @@
 /*
  * Author: Honbo He
- * RTP Kernel
+ * RTP Multi-Task Kernel
+ *
  * 2022-12-16
  */
 #include <stdint.h>
 #include <cmsis_gcc.h>
+#include <rtp-kernel.h>
 
 #define	BIT(n)		(1UL << n)
-
-#define sti()  __asm ("cpsie i" ::: "memory")
-#define cli()  __asm ("cpsid i" ::: "memory")
 #define svc(n) __asm ("svc %0" :: "i"(n))
 
 #define SCB_ICSR        (*(volatile uint32_t *)0xE000ED04)
 #define ICSR_PENDSVSET  BIT(28)
-
-#define MAX_TASKS		5
-#define STACK_SIZE		256
 
 enum stat {
 	RTP_STAT_UNUSED,
@@ -30,16 +26,20 @@ struct task {
 	enum stat       stat;
 };
 
-typedef void (*taskloop_t)(void);
-
 static struct task task_list[MAX_TASKS];
 static uint32_t task_stacks[MAX_TASKS][STACK_SIZE];
 static uint32_t current_task;
 static uint32_t next_task;
 
-void rtp_task_exit(void);
 
+int rtp_current_get(void)
+{
+	return current_task;
+}
 
+/* idle task: tid should be 0 and won't exit
+ * if no ready or running task, idle will be schedule
+ */
 void rtp_idle_task(void)
 {
 	while (1)
@@ -82,12 +82,6 @@ int rtp_stack_init(int tid, taskloop_t task)
     *(--stk) = 0x04040404;				// R4
 
 	task_list[tid].stack = stk;
-	return 0;
-}
-
-int rtp_os_init(void)
-{
-	//TODO: Get the sysclk and adjust mdelay
 	return 0;
 }
 
@@ -154,7 +148,7 @@ void rtp_task_exit(void)
 
 	/* If PendSV was preempted by a high-prio interrupt,
 	 * after the interrupt ends, pop {lr} returns to a
-	 * task which has already exist
+	 * task which has already exit
 	 * it will cause os panic, so the nop loop is nescessry
 	 */
 	while (1) __NOP();
@@ -185,6 +179,12 @@ void rtp_tick_handler(void)
 	rtp_pendsv_call();
 }
 
+int rtp_os_init(void)
+{
+	rtp_create_task(rtp_idle_task);
+	return 0;
+}
+
 void rtp_os_start(void)
 {
 	uint32_t *cstack;
@@ -192,10 +192,14 @@ void rtp_os_start(void)
 	current_task = 0;
 	next_task = 0;
 
-	rtp_create_task(rtp_idle_task);
 	cstack = task_list[current_task].stack;
 
 	__asm volatile (
+		/* set the core to `Privileged Thread Mode: control[0] = 0
+		 * is for `rtp_pendsv_call works in scheduler
+		 * by the way, disabling user access to registers in RTOS
+		 * is an inappropriate operation
+		 */
 		"msr psp, %0            \n"
 		"mov r0, #2             \n"
 		"msr control, r0        \n"
@@ -223,6 +227,7 @@ uint32_t rtp_stack_switch(uint32_t cstack)
 {
 	task_list[current_task].stack = (uint32_t *)cstack;
 	current_task = next_task;
+
 	return (uint32_t)task_list[current_task].stack;
 }
 
