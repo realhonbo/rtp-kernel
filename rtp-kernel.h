@@ -4,19 +4,16 @@
 #include <stdint.h>
 #include <cmsis_gcc.h>
 
+//#define RTP_DEBUG
 /* MAX_TASKS can only be the power of 2
  * because it will be used in scheduler as mask code
  * for extremely preformance
  *
  * it include idle task
  */
-#define RTP_MAXTASK_2	2
-#define RTP_MAXTASK_4	4
-#define RTP_MAXTASK_8	8
-#define RTP_MAXTASK_16	16
-
-#define MAX_TASKS		RTP_MAXTASK_4
-#define STACK_SIZE		256
+#define RTP_MAXTASK_SHIFT	3
+#define MAX_TASKS			(1 << RTP_MAXTASK_SHIFT)
+#define STACK_SIZE			256
 
 typedef void (*taskloop_t)(void);
 typedef int rtp_tid_t;

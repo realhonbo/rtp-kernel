@@ -8,16 +8,24 @@
 #include <stdint.h>
 #include <cmsis_gcc.h>
 
+#ifndef __always_inline
+#define __always_inline inline __attribute__((always_inline))
+#endif
+
+#define RTP_CLI() __disable_irq()
+#define RTP_STI() __enable_irq()
+
 #define	BIT(n)		(1UL << n)
 #define svc(n) __asm ("svc %0" :: "i"(n))
 
 #define SCB_ICSR        (*(volatile uint32_t *)0xE000ED04)
 #define ICSR_PENDSVSET  BIT(28)
 
+#define RTP_STACK_MAGIC	0xDEADBEEF
 #define RTP_TIME_SLICE	10
 
 enum stat {
-	RTP_STAT_UNUSED,
+	RTP_STAT_UNUSED = 0,
 	RTP_STAT_RUNNING,
 	RTP_STAT_BLOCKED
 };
@@ -25,14 +33,42 @@ enum stat {
 struct task {
 	rtp_tid_t       tid;
 	uint32_t       *stack;
-	uint32_t        tick;
-	uint32_t        slice;
+	uint32_t        tick;	/* wake up timestamp */
+	uint32_t        slice;	/* time slice */
 	enum stat       stat;
 };
 
 /* task list */
 static struct task task_list[MAX_TASKS];
 static uint32_t task_stacks[MAX_TASKS][STACK_SIZE];
+
+
+static void rtp_kernel_panic(const char *msg)
+{
+	(void) msg;
+	while(1) __NOP();
+}
+
+/* bitmap for O1 scheduling lookup */
+typedef uint32_t rtp_bm_t;
+static volatile rtp_bm_t rtp_runnin_grp;
+
+static void rtp_rgrp_init(void)
+{
+	rtp_runnin_grp = 0;
+}
+
+static __always_inline void rtp_rgrp_set(uint32_t bit)
+{
+    rtp_runnin_grp |= (1UL << bit);
+}
+
+static __always_inline void rtp_rgrp_clear(uint32_t bit)
+{
+    rtp_runnin_grp &= ~(1UL << bit);
+}
+
+#define rtp_rgrp_get()	(rtp_runnin_grp)
 
 /* scheduler reference */
 static uint32_t current_task;
@@ -42,9 +78,8 @@ static uint32_t next_task;
  * 0x80000000 = 2^31, the highest bit is 1 which indicate
  * a negative number in signed int
  */
-static uint32_t rtp_os_tick;
-#define RTP_TICK_AFTER(tick) (rtp_os_tick - tick < 0x80000000)
-
+static volatile uint32_t rtp_os_tick;
+#define RTP_TICK_AFTER(tick) ((int)(rtp_os_tick - tick) >= 0)
 
 rtp_tid_t rtp_alloc_tid(void)
 {
@@ -85,6 +120,9 @@ int rtp_stack_init(int tid, taskloop_t task)
 {
 	uint32_t *stk;
 
+	/* guard for stack overflow */
+	task_stacks[tid][0] = RTP_STACK_MAGIC;
+
 	stk = &task_stacks[tid][STACK_SIZE];
 
 	/* fill magic number for a new task at start
@@ -116,17 +154,21 @@ int rtp_create_task(taskloop_t task)
 {
 	int id;
 
+	RTP_CLI();
 	id = rtp_alloc_tid();
 	if (id < 0)
-		return -1;
+		goto out;
 
 	rtp_stack_init(id, task);
-	task_list[id].tid	= id;
-	task_list[id].tick	= 0;
-	task_list[id].stat	= RTP_STAT_RUNNING;
+	task_list[id].tid   = id;
+	task_list[id].tick  = 0;
+	task_list[id].stat  = RTP_STAT_RUNNING;
 	task_list[id].slice = RTP_TIME_SLICE;
 
-	return 0;
+	rtp_rgrp_set(id);
+out:
+	RTP_STI();
+	return id;
 }
 
 /* rtp scheduler: simpl RR policy
@@ -134,33 +176,36 @@ int rtp_create_task(taskloop_t task)
  */
 void rtp_os_schedule(void)
 {
-	int i;
-	uint32_t idx = current_task;
+	uint32_t mask_upper;
 
-	for (i = 1; i < MAX_TASKS; i++) {
-		idx = (current_task + i) & (MAX_TASKS - 1);
-		if (idx == 0) idx = 1;
+	/* ignore the prev tasks, get bitmap of tasks
+	 * which are the next
+	 * if no next tasks, round and jump over idle
+	 */
+	mask_upper = rtp_rgrp_get() & ~((1UL << (current_task + 1)) - 1);
+	if (! mask_upper)
+		mask_upper = rtp_rgrp_get() & ~1UL;
 
-		if (task_list[idx].stat == RTP_STAT_RUNNING &&
-			task_list[idx].slice > 0) {
+    if (! mask_upper)
+        next_task = 0;
+    else {
+		/* get the lowest set bit, which is the tid of next task
+		 */
+        next_task = __builtin_ctz(mask_upper);
 
-			next_task = idx;
-			return;
-		}
-	}
-
-	for (i = 1; i < MAX_TASKS; i++) {
-		if (task_list[i].stat == RTP_STAT_RUNNING)
-			task_list[i].slice = RTP_TIME_SLICE;
-	}
-
-	next_task = 0;
+        if (task_list[next_task].slice == 0) {
+             task_list[next_task].slice = RTP_TIME_SLICE;
+        }
+    }
 }
 
 void rtp_yield(void)
 {
+	RTP_CLI();
 	rtp_os_schedule();
-	rtp_pendsv_call();
+	if (next_task != current_task)
+		rtp_pendsv_call();
+	RTP_STI();
 }
 
 void rtp_delete_task(int tid)
@@ -168,11 +213,14 @@ void rtp_delete_task(int tid)
 	if (tid < 1 || tid > MAX_TASKS - 1)
 		return;
 
+	RTP_CLI();
 	task_list[tid].stat = RTP_STAT_UNUSED;
 
 	if (tid == current_task) {
-		rtp_yield();
+		rtp_os_schedule();
+		rtp_pendsv_call();
 	}
+	RTP_STI();
 }
 
 void rtp_task_exit(void)
@@ -192,9 +240,14 @@ void rtp_msleep(uint32_t delay)
 	if (delay == 0)
 		return;
 
+	RTP_CLI();
 	task_list[current_task].tick = rtp_os_tick + delay;
 	task_list[current_task].stat = RTP_STAT_BLOCKED;
-	rtp_yield();
+	rtp_rgrp_clear(current_task);
+
+	rtp_os_schedule();
+	rtp_pendsv_call();
+	RTP_STI();
 }
 
 void rtp_tick_handler(void)
@@ -208,6 +261,7 @@ void rtp_tick_handler(void)
 			continue;
 		if (RTP_TICK_AFTER(task_list[i].tick)) {
 			task_list[i].stat = RTP_STAT_RUNNING;
+			rtp_rgrp_set(i);
 		}
 	}
 
@@ -218,14 +272,19 @@ void rtp_tick_handler(void)
 			return;
 		}
 	}
-
-	rtp_yield();
+	rtp_os_schedule();
+	rtp_pendsv_call();
 }
 
 int rtp_os_init(void)
 {
+	/* clear task bitmap */
+	rtp_rgrp_init();
+
+	/* init idle task */
 	rtp_create_task(rtp_idle_task);
 	task_list[0].slice = 1;
+
 	return 0;
 }
 
@@ -234,6 +293,11 @@ void rtp_os_start(void)
 	uint32_t *cstack;
 
 	current_task = 1;
+	rtp_rgrp_set(0);
+	if ((rtp_rgrp_get() & ~1UL) == 0)
+		current_task = 0;
+	next_task = current_task;
+
 	cstack = task_list[current_task].stack;
 
 	__asm volatile (
@@ -264,11 +328,20 @@ void rtp_os_start(void)
 	);
 }
 
+__attribute__((unused))
+static void rtp_check_stack(rtp_tid_t tid)
+{
+	if (task_stacks[tid][0] != RTP_STACK_MAGIC)
+		rtp_kernel_panic("Stack Overflow!");
+}
+
 uint32_t rtp_stack_switch(uint32_t cstack)
 {
 	task_list[current_task].stack = (uint32_t *)cstack;
+#ifdef RTP_DEBUG
+	rtp_check_stack(current_task);
+#endif
 	current_task = next_task;
-
 	return (uint32_t)task_list[current_task].stack;
 }
 
