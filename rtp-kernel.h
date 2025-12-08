@@ -4,10 +4,22 @@
 #include <stdint.h>
 #include <cmsis_gcc.h>
 
-#define MAX_TASKS		5
+/* MAX_TASKS can only be the power of 2
+ * because it will be used in scheduler as mask code
+ * for extremely preformance
+ *
+ * it include idle task
+ */
+#define RTP_MAXTASK_2	2
+#define RTP_MAXTASK_4	4
+#define RTP_MAXTASK_8	8
+#define RTP_MAXTASK_16	16
+
+#define MAX_TASKS		RTP_MAXTASK_4
 #define STACK_SIZE		256
 
 typedef void (*taskloop_t)(void);
+typedef int rtp_tid_t;
 
 int rtp_os_init(void);
 int rtp_create_task(taskloop_t task);
@@ -17,7 +29,8 @@ void rtp_delete_task(int tid);
 void rtp_task_exit(void);
 
 int rtp_current_get(void);
-void rtp_mdelay(uint32_t delay);
+void rtp_yield(void);
+void rtp_msleep(uint32_t delay);
 
 
 typedef struct {
@@ -65,7 +78,6 @@ static inline void rtp_spin_lock(spinlock_t *spin)
 		__WFI();
 		spin->tickets.next = REREAD(spin->tickets.next);
 	}
-#undef REREAD
 	__DMB();
 }
 
@@ -74,6 +86,13 @@ static inline void rtp_spin_unlock(spinlock_t *spin)
 	__DMB();
 	spin->tickets.next ++;
 	__DSB();
+}
+
+static inline int spin_is_locked(const spinlock_t *spin)
+{
+	spinlock_t _spin = REREAD(*spin);
+	return _spin.tickets.owner == _spin.tickets.next;
+#undef REREAD
 }
 
 
