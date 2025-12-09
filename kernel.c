@@ -1,7 +1,7 @@
 /*
- * Author: Honbo He
- * RTP Multi-Task Kernel
+ * RTP Multi-Task Real-Time Kernel for ARMv7-M Chips
  *
+ * Copyright(C) Honbo He
  * 2022-12-16
  */
 #include <rtp-kernel.h>
@@ -16,13 +16,11 @@
 #define RTP_STI() __enable_irq()
 
 #define	BIT(n)		(1UL << n)
-#define svc(n) __asm ("svc %0" :: "i"(n))
 
-#define SCB_ICSR        (*(volatile uint32_t *)0xE000ED04)
-#define ICSR_PENDSVSET  BIT(28)
-
-#define RTP_STACK_MAGIC	0xDEADBEEF
-#define RTP_TIME_SLICE	10
+#define SCB_ICSR            (*(volatile uint32_t *)0xE000ED04)
+#define ICSR_PENDSVSET      BIT(28)
+#define RTP_STACK_MAGIC     0xDEADBEEF
+#define RTP_TIME_SLICE      10
 
 enum stat {
 	RTP_STAT_UNUSED = 0,
@@ -49,26 +47,30 @@ static void rtp_kernel_panic(const char *msg)
 	while(1) __NOP();
 }
 
-/* bitmap for O1 scheduling lookup */
-typedef uint32_t rtp_bm_t;
-static volatile rtp_bm_t rtp_runnin_grp;
+/* bitmap for O(1) scheduling lookup
+ *
+ * rtp_rdy_grp: task ready: RUNNING stat and has slice
+ * rtp_exp_grp: task expired: RUNNING stat but slice = 0
+ */
+typedef volatile uint32_t rtp_bm_t;
 
-static void rtp_rgrp_init(void)
+static rtp_bm_t rtp_rdy_grp;
+static rtp_bm_t rtp_exp_grp;
+
+static void rtp_bitmap_init(rtp_bm_t *bitmap)
 {
-	rtp_runnin_grp = 0;
+	*bitmap = 0;
 }
 
-static __always_inline void rtp_rgrp_set(uint32_t bit)
+static __always_inline void rtp_bitmap_set(rtp_bm_t *bitmap, uint32_t bit)
 {
-    rtp_runnin_grp |= (1UL << bit);
+    *bitmap |= (1UL << bit);
 }
 
-static __always_inline void rtp_rgrp_clear(uint32_t bit)
+static __always_inline void rtp_bitmap_clear(rtp_bm_t *bitmap, uint32_t bit)
 {
-    rtp_runnin_grp &= ~(1UL << bit);
+    *bitmap &= ~(1UL << bit);
 }
-
-#define rtp_rgrp_get()	(rtp_runnin_grp)
 
 /* scheduler reference */
 static uint32_t current_task;
@@ -85,12 +87,11 @@ rtp_tid_t rtp_alloc_tid(void)
 {
 	int i, tid = -1;
 
-	for (i = 0; i < MAX_TASKS; i++) {
+	for (i = 0; i < MAX_TASKS; i++)
 		if (task_list[i].stat == RTP_STAT_UNUSED) {
 			tid = i;
 			break;
 		}
-	}
 	return tid;
 }
 
@@ -165,26 +166,36 @@ int rtp_create_task(taskloop_t task)
 	task_list[id].stat  = RTP_STAT_RUNNING;
 	task_list[id].slice = RTP_TIME_SLICE;
 
-	rtp_rgrp_set(id);
+	rtp_bitmap_set(&rtp_rdy_grp, id);
 out:
 	RTP_STI();
 	return id;
 }
 
-/* rtp scheduler: simpl RR policy
+/*
+ * rtp scheduler: RR with O(1) lookup
  * task_list[0] always keep for idle
  */
 void rtp_os_schedule(void)
 {
-	uint32_t mask_upper;
+	rtp_bm_t mask_upper;
+
+	/* epoch switch
+	 * if no task whose stat == running & slice > 0, exchange
+	 * the ready bitmap and expired bitmap
+	 */
+	if ((rtp_rdy_grp & ~1UL) == 0 && (rtp_exp_grp & ~1UL) != 0) {
+		rtp_rdy_grp |= rtp_exp_grp;
+		rtp_exp_grp = 0;
+	}
 
 	/* ignore the prev tasks, get bitmap of tasks
 	 * which are the next
 	 * if no next tasks, round and jump over idle
 	 */
-	mask_upper = rtp_rgrp_get() & ~((1UL << (current_task + 1)) - 1);
+	mask_upper = rtp_rdy_grp & ~((1UL << (current_task + 1)) - 1);
 	if (! mask_upper)
-		mask_upper = rtp_rgrp_get() & ~1UL;
+		mask_upper = rtp_rdy_grp & ~1UL;
 
     if (! mask_upper)
         next_task = 0;
@@ -193,6 +204,11 @@ void rtp_os_schedule(void)
 		 */
         next_task = __builtin_ctz(mask_upper);
 
+		/* lazy refill
+		 * only if task was chosen by. in this case slice == 0 indicates
+		 * the task has just returned from the expired group, recharge it
+		 * to avoids the O(N) traversal assignment overhead
+		 */
         if (task_list[next_task].slice == 0) {
              task_list[next_task].slice = RTP_TIME_SLICE;
         }
@@ -202,9 +218,23 @@ void rtp_os_schedule(void)
 void rtp_yield(void)
 {
 	RTP_CLI();
+
+	/* give up the remaining time slice
+	 * move from ready group to expires
+	 */
+	task_list[current_task].slice = 0;
+	rtp_bitmap_clear(&rtp_rdy_grp, current_task);
+	rtp_bitmap_set(&rtp_exp_grp, current_task);
+
 	rtp_os_schedule();
+	/*
+	 * if there is only 1 task, next_task will be
+	 * set to itself after schedule
+	 * in this case should not trigger task_switch
+	 */
 	if (next_task != current_task)
 		rtp_pendsv_call();
+
 	RTP_STI();
 }
 
@@ -215,6 +245,9 @@ void rtp_delete_task(int tid)
 
 	RTP_CLI();
 	task_list[tid].stat = RTP_STAT_UNUSED;
+
+	rtp_bitmap_clear(&rtp_rdy_grp, tid);
+	rtp_bitmap_clear(&rtp_exp_grp, tid);
 
 	if (tid == current_task) {
 		rtp_os_schedule();
@@ -235,18 +268,20 @@ void rtp_task_exit(void)
 	while (1) __NOP();
 }
 
+/* rtp_msleep(0) will try schedule to other tasks
+ * if no another, it equals to rtp_msleep(1 tick)
+ */
 void rtp_msleep(uint32_t delay)
 {
-	if (delay == 0)
-		return;
-
 	RTP_CLI();
+
 	task_list[current_task].tick = rtp_os_tick + delay;
 	task_list[current_task].stat = RTP_STAT_BLOCKED;
-	rtp_rgrp_clear(current_task);
+	rtp_bitmap_clear(&rtp_rdy_grp, current_task);
 
 	rtp_os_schedule();
 	rtp_pendsv_call();
+
 	RTP_STI();
 }
 
@@ -255,23 +290,29 @@ void rtp_tick_handler(void)
 	int i;
 	rtp_os_tick ++;
 
-	/* check and wave sleeping tasks */
+	/* check and wake sleeping tasks */
 	for (i = 1; i < MAX_TASKS; i++) {
 		if (task_list[i].stat != RTP_STAT_BLOCKED)
 			continue;
+
 		if (RTP_TICK_AFTER(task_list[i].tick)) {
 			task_list[i].stat = RTP_STAT_RUNNING;
-			rtp_rgrp_set(i);
+			rtp_bitmap_set(&rtp_rdy_grp, i);
 		}
 	}
 
-	/* modify time slice */
+	/* modify the time slice. if time slice exhausted,
+	 * move the task to expires group and trigger schedule
+	 */
 	if (current_task != 0) {
-		if (task_list[current_task].slice > 0) {
+		if (task_list[current_task].slice > 0)
 			task_list[current_task].slice --;
+		if (task_list[current_task].slice > 0)
 			return;
-		}
+		rtp_bitmap_clear(&rtp_rdy_grp, current_task);
+		rtp_bitmap_set(&rtp_exp_grp, current_task);
 	}
+
 	rtp_os_schedule();
 	rtp_pendsv_call();
 }
@@ -279,7 +320,8 @@ void rtp_tick_handler(void)
 int rtp_os_init(void)
 {
 	/* clear task bitmap */
-	rtp_rgrp_init();
+	rtp_bitmap_init(&rtp_rdy_grp);
+	rtp_bitmap_init(&rtp_exp_grp);
 
 	/* init idle task */
 	rtp_create_task(rtp_idle_task);
@@ -293,8 +335,8 @@ void rtp_os_start(void)
 	uint32_t *cstack;
 
 	current_task = 1;
-	rtp_rgrp_set(0);
-	if ((rtp_rgrp_get() & ~1UL) == 0)
+	rtp_bitmap_set(&rtp_rdy_grp, 0);
+	if ((rtp_rdy_grp & ~1UL) == 0)
 		current_task = 0;
 	next_task = current_task;
 
