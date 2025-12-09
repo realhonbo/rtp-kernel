@@ -5,8 +5,8 @@
 #include <cmsis_gcc.h>
 
 //#define RTP_DEBUG
-#define MAX_TASKS		5
-#define STACK_SIZE		256
+#define RTP_STACK_SIZE  2048
+#define MAX_TASKS       4
 
 typedef void (*taskloop_t)(void);
 typedef int rtp_tid_t;
@@ -22,6 +22,8 @@ int rtp_current_get(void);
 void rtp_yield(void);
 void rtp_msleep(uint32_t delay);
 
+#define RTP_CLI() __disable_irq()
+#define RTP_STI() __enable_irq()
 
 typedef struct {
 union {
@@ -63,8 +65,11 @@ static inline void rtp_spin_lock(spinlock_t *spin)
 	);
 
 	while (ticket != spin->tickets.next) {
+		RTP_CLI();
 		rtp_os_schedule();
 		rtp_pendsv_call();
+		RTP_STI();
+
 		__WFI();
 		spin->tickets.next = REREAD(spin->tickets.next);
 	}

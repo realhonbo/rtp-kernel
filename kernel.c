@@ -12,10 +12,8 @@
 #define __always_inline inline __attribute__((always_inline))
 #endif
 
-#define RTP_CLI() __disable_irq()
-#define RTP_STI() __enable_irq()
-
 #define	BIT(n)		(1UL << n)
+#define STACK_SIZE	(RTP_STACK_SIZE >> 2)
 
 #define SCB_ICSR            (*(volatile uint32_t *)0xE000ED04)
 #define ICSR_PENDSVSET      BIT(28)
@@ -38,7 +36,7 @@ struct task {
 
 /* task list */
 static struct task task_list[MAX_TASKS];
-static uint32_t task_stacks[MAX_TASKS][STACK_SIZE];
+static uint32_t task_stacks[MAX_TASKS][STACK_SIZE] __attribute__((aligned(8)));
 
 
 static void rtp_kernel_panic(const char *msg)
