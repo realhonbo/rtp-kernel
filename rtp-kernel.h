@@ -2,17 +2,15 @@
 #define RTP_KERNEL
 
 #include <stdint.h>
-#include <cmsis_gcc.h>
 
 //#define RTP_DEBUG
 #define RTP_STACK_SIZE  2048
-#define MAX_TASKS       4
+#define RTP_TASKS       4
 
-typedef void (*taskloop_t)(void);
 typedef int rtp_tid_t;
 
 int rtp_os_init(void);
-int rtp_create_task(taskloop_t task);
+int rtp_create_task(void *entry, void *stack_addr, uint32_t stack_size);
 void rtp_os_start(void);
 
 void rtp_delete_task(int tid);
@@ -22,8 +20,13 @@ int rtp_current_get(void);
 void rtp_yield(void);
 void rtp_msleep(uint32_t delay);
 
-#define RTP_CLI() __disable_irq()
-#define RTP_STI() __enable_irq()
+#define __CLI()		__asm volatile ("cpsid i" ::: "memory")
+#define __STI()		__asm volatile ("cpsie i" ::: "memory")
+#define __WFI()		__asm volatile ("wfi" ::: "memory")
+#define __NOP()		__asm volatile ("nop")
+#define __DMB()		__asm volatile ("dmb 0xf" ::: "memory")
+#define __DSB()		__asm volatile ("dsb 0xf" ::: "memory")
+#define __ISB()		__asm volatile ("isb 0xf" ::: "memory")
 
 typedef struct {
 union {
@@ -46,7 +49,7 @@ static inline void rtp_spin_init(spinlock_t *spin)
 
 static inline void rtp_spin_lock(spinlock_t *spin)
 {
-#define REREAD(x) (* (volatile typeof(x) *)&(x))
+#define REREAD(x) (* (volatile __typeof__(x) *)&(x))
 	extern void rtp_os_schedule(void);
 	extern void rtp_pendsv_call(void);
 
@@ -65,10 +68,10 @@ static inline void rtp_spin_lock(spinlock_t *spin)
 	);
 
 	while (ticket != spin->tickets.next) {
-		RTP_CLI();
+		__CLI();
 		rtp_os_schedule();
 		rtp_pendsv_call();
-		RTP_STI();
+		__STI();
 
 		__WFI();
 		spin->tickets.next = REREAD(spin->tickets.next);

@@ -5,8 +5,6 @@
  * 2022-12-16
  */
 #include <rtp-kernel.h>
-#include <stdint.h>
-#include <cmsis_gcc.h>
 
 #ifndef __always_inline
 #define __always_inline inline __attribute__((always_inline))
@@ -14,6 +12,7 @@
 
 #define	BIT(n)		(1UL << n)
 #define STACK_SIZE	(RTP_STACK_SIZE >> 2)
+#define MAX_TASKS   (RTP_TASKS + 1)
 
 #define SCB_ICSR            (*(volatile uint32_t *)0xE000ED04)
 #define ICSR_PENDSVSET      BIT(28)
@@ -28,7 +27,12 @@ enum stat {
 
 struct task {
 	rtp_tid_t       tid;
-	uint32_t       *stack;
+
+	void           *entry;
+	void           *sp;
+	void           *stack_addr;
+	uint32_t        stack_size;
+
 	uint32_t        tick;	/* wake up timestamp */
 	uint32_t        slice;	/* time slice */
 	enum stat       stat;
@@ -36,7 +40,7 @@ struct task {
 
 /* task list */
 static struct task task_list[MAX_TASKS];
-static uint32_t task_stacks[MAX_TASKS][STACK_SIZE] __attribute__((aligned(8)));
+static char idle_stack[128] __attribute__((aligned(8)));
 
 
 static void rtp_kernel_panic(const char *msg)
@@ -115,58 +119,71 @@ void rtp_pendsv_call(void)
 	__ISB();
 }
 
-int rtp_stack_init(int tid, taskloop_t task)
+int rtp_stack_init(int tid, void *stack_addr, uint32_t stack_size)
 {
-	uint32_t *stk;
+	uint32_t stk, *sp;
+	void *entry;
+
+	task_list[tid].stack_addr = stack_addr;
+	task_list[tid].stack_size = stack_size;
 
 	/* guard for stack overflow */
-	task_stacks[tid][0] = RTP_STACK_MAGIC;
+	*(uint32_t *)stack_addr = RTP_STACK_MAGIC;
 
-	stk = &task_stacks[tid][STACK_SIZE];
+	/* AAPCS standard: 8 bytes aligned stack */
+	stk = (uint32_t)stack_addr + stack_size;
+	stk &= ~7UL;
 
 	/* fill magic number for a new task at start
 	 * xPSR: set the BIT(24) to indicate a Thumb2 code
 	 */
-	*(--stk) = BIT(24);					// xPSR
-	*(--stk) = (uint32_t) task;			// PC
-    *(--stk) = (uint32_t) rtp_task_exit;// LR
-    *(--stk) = 0x12121212;				// R12
-    *(--stk) = 0x03030303;				// R3
-    *(--stk) = 0x02020202;				// R2
-    *(--stk) = 0x01010101;				// R1
-    *(--stk) = 0x00000000;				// R0
+	sp = (uint32_t *) stk;
+	entry = task_list[tid].entry;
 
-	*(--stk) = 0x11111111;				// R11
-    *(--stk) = 0x10101010;				// R10
-    *(--stk) = 0x09090909;				// R9
-    *(--stk) = 0x08080808;				// R8
-    *(--stk) = 0x07070707;				// R7
-    *(--stk) = 0x06060606;				// R6
-    *(--stk) = 0x05050505;				// R5
-    *(--stk) = 0x04040404;				// R4
+	*(--sp) = BIT(24);                  // xPSR
+	*(--sp) = (uint32_t) entry;         // PC
+	*(--sp) = (uint32_t) rtp_task_exit; // LR
+	*(--sp) = 0x12121212;               // R12
+	*(--sp) = 0x03030303;               // R3
+	*(--sp) = 0x02020202;               // R2
+	*(--sp) = 0x01010101;               // R1
+	*(--sp) = 0x00000000;               // R0
 
-	task_list[tid].stack = stk;
+	*(--sp) = 0x11111111;               // R11
+	*(--sp) = 0x10101010;               // R10
+	*(--sp) = 0x09090909;               // R9
+	*(--sp) = 0x08080808;               // R8
+	*(--sp) = 0x07070707;               // R7
+	*(--sp) = 0x06060606;               // R6
+	*(--sp) = 0x05050505;               // R5
+	*(--sp) = 0x04040404;               // R4
+
+	task_list[tid].sp = (void *)sp;
 	return 0;
 }
 
-int rtp_create_task(taskloop_t task)
+int rtp_create_task(void *entry, void *stack_addr, uint32_t stack_size)
 {
 	int id;
 
-	RTP_CLI();
+	if (!stack_addr || stack_size < sizeof(uint32_t) * 32)
+		return -1;
+
+	__CLI();
 	id = rtp_alloc_tid();
 	if (id < 0)
 		goto out;
 
-	rtp_stack_init(id, task);
 	task_list[id].tid   = id;
 	task_list[id].tick  = 0;
 	task_list[id].stat  = RTP_STAT_RUNNING;
 	task_list[id].slice = RTP_TIME_SLICE;
+	task_list[id].entry = entry;
+	rtp_stack_init(id, stack_addr, stack_size);
 
 	rtp_bitmap_set(&rtp_rdy_grp, id);
 out:
-	RTP_STI();
+	__STI();
 	return id;
 }
 
@@ -215,7 +232,7 @@ void rtp_os_schedule(void)
 
 void rtp_yield(void)
 {
-	RTP_CLI();
+	__CLI();
 
 	/* give up the remaining time slice
 	 * move from ready group to expires
@@ -233,7 +250,7 @@ void rtp_yield(void)
 	if (next_task != current_task)
 		rtp_pendsv_call();
 
-	RTP_STI();
+	__STI();
 }
 
 void rtp_delete_task(int tid)
@@ -241,7 +258,7 @@ void rtp_delete_task(int tid)
 	if (tid < 1 || tid > MAX_TASKS - 1)
 		return;
 
-	RTP_CLI();
+	__CLI();
 	task_list[tid].stat = RTP_STAT_UNUSED;
 
 	rtp_bitmap_clear(&rtp_rdy_grp, tid);
@@ -251,7 +268,7 @@ void rtp_delete_task(int tid)
 		rtp_os_schedule();
 		rtp_pendsv_call();
 	}
-	RTP_STI();
+	__STI();
 }
 
 void rtp_task_exit(void)
@@ -271,7 +288,7 @@ void rtp_task_exit(void)
  */
 void rtp_msleep(uint32_t delay)
 {
-	RTP_CLI();
+	__CLI();
 
 	task_list[current_task].tick = rtp_os_tick + delay;
 	task_list[current_task].stat = RTP_STAT_BLOCKED;
@@ -280,7 +297,7 @@ void rtp_msleep(uint32_t delay)
 	rtp_os_schedule();
 	rtp_pendsv_call();
 
-	RTP_STI();
+	__STI();
 }
 
 void rtp_tick_handler(void)
@@ -322,7 +339,7 @@ int rtp_os_init(void)
 	rtp_bitmap_init(&rtp_exp_grp);
 
 	/* init idle task */
-	rtp_create_task(rtp_idle_task);
+	rtp_create_task(rtp_idle_task, idle_stack, sizeof(idle_stack));
 	task_list[0].slice = 1;
 
 	return 0;
@@ -338,7 +355,7 @@ void rtp_os_start(void)
 		current_task = 0;
 	next_task = current_task;
 
-	cstack = task_list[current_task].stack;
+	cstack = task_list[current_task].sp;
 
 	__asm volatile (
 	/* set the core to `Privileged Thread Mode: control[0] = 0
@@ -371,22 +388,26 @@ void rtp_os_start(void)
 __attribute__((unused))
 static void rtp_check_stack(rtp_tid_t tid)
 {
-	if (task_stacks[tid][0] != RTP_STACK_MAGIC)
+	void *magic;
+
+	magic = task_list[tid].stack_addr;
+	if (*(uint32_t *)magic != RTP_STACK_MAGIC) {
 		rtp_kernel_panic("Stack Overflow!");
+	}
 }
 
 uint32_t rtp_stack_switch(uint32_t cstack)
 {
-	task_list[current_task].stack = (uint32_t *)cstack;
+	task_list[current_task].sp = (uint32_t *)cstack;
 #ifdef RTP_DEBUG
 	rtp_check_stack(current_task);
 #endif
 	current_task = next_task;
-	return (uint32_t)task_list[current_task].stack;
+	return (uint32_t)task_list[current_task].sp;
 }
 
 __attribute__((naked))
-void PendSV_Handler(void)
+void pend_sv_handler(void)
 {
 	__asm volatile (
 	/* store current context */
