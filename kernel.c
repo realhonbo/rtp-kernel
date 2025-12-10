@@ -11,8 +11,8 @@
 #endif
 
 #define	BIT(n)		(1UL << n)
-#define STACK_SIZE	(RTP_STACK_SIZE >> 2)
 #define MAX_TASKS   (RTP_TASKS + 1)
+#define MINIMAL_STACK_SIZE  128
 
 #define SCB_ICSR            (*(volatile uint32_t *)0xE000ED04)
 #define ICSR_PENDSVSET      BIT(28)
@@ -29,18 +29,21 @@ struct task {
 	rtp_tid_t       tid;
 
 	void           *entry;
-	void           *sp;
+	void           *sp;     /* stack */
 	void           *stack_addr;
 	uint32_t        stack_size;
 
-	uint32_t        tick;	/* wake up timestamp */
-	uint32_t        slice;	/* time slice */
+	uint32_t        tick;   /* wake up timestamp */
+
+	uint32_t        init_slice;
+	uint32_t        slice;  /* time slice */
+
 	enum stat       stat;
 };
 
 /* task list */
 static struct task task_list[MAX_TASKS];
-static char idle_stack[128] __attribute__((aligned(8)));
+static char idle_stack[MINIMAL_STACK_SIZE] __attribute__((aligned(8)));
 
 
 static void rtp_kernel_panic(const char *msg)
@@ -162,12 +165,16 @@ int rtp_stack_init(int tid, void *stack_addr, uint32_t stack_size)
 	return 0;
 }
 
-int rtp_create_task(void *entry, void *stack_addr, uint32_t stack_size)
+int rtp_create_task(void *entry,
+					void *stack_addr, uint32_t stack_size,
+					uint32_t slice)
 {
 	int id;
 
-	if (!stack_addr || stack_size < sizeof(uint32_t) * 32)
+	if (!stack_addr || stack_size < MINIMAL_STACK_SIZE)
 		return -1;
+	if (slice == 0)
+		slice = RTP_TIME_SLICE;
 
 	__CLI();
 	id = rtp_alloc_tid();
@@ -177,7 +184,8 @@ int rtp_create_task(void *entry, void *stack_addr, uint32_t stack_size)
 	task_list[id].tid   = id;
 	task_list[id].tick  = 0;
 	task_list[id].stat  = RTP_STAT_RUNNING;
-	task_list[id].slice = RTP_TIME_SLICE;
+	task_list[id].init_slice = slice;
+	task_list[id].slice = slice;
 	task_list[id].entry = entry;
 	rtp_stack_init(id, stack_addr, stack_size);
 
@@ -194,6 +202,7 @@ out:
 void rtp_os_schedule(void)
 {
 	rtp_bm_t mask_upper;
+	struct task *_task;
 
 	/* epoch switch
 	 * if no task whose stat == running & slice > 0, exchange
@@ -225,7 +234,8 @@ void rtp_os_schedule(void)
 		 * to avoids the O(N) traversal assignment overhead
 		 */
         if (task_list[next_task].slice == 0) {
-             task_list[next_task].slice = RTP_TIME_SLICE;
+			_task = &task_list[next_task];
+			_task->slice = _task->init_slice;
         }
     }
 }
@@ -339,8 +349,7 @@ int rtp_os_init(void)
 	rtp_bitmap_init(&rtp_exp_grp);
 
 	/* init idle task */
-	rtp_create_task(rtp_idle_task, idle_stack, sizeof(idle_stack));
-	task_list[0].slice = 1;
+	rtp_create_task(rtp_idle_task, idle_stack, sizeof(idle_stack), 1);
 
 	return 0;
 }

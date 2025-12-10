@@ -4,13 +4,14 @@
 #include <stdint.h>
 
 //#define RTP_DEBUG
-#define RTP_STACK_SIZE  2048
-#define RTP_TASKS       4
+#define RTP_TASKS       15
 
 typedef int rtp_tid_t;
 
 int rtp_os_init(void);
-int rtp_create_task(void *entry, void *stack_addr, uint32_t stack_size);
+int rtp_create_task(void *entry,
+					void *stack_addr, uint32_t stack_size,
+					uint32_t slice);
 void rtp_os_start(void);
 
 void rtp_delete_task(int tid);
