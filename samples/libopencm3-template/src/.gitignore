@@ -1,0 +1,7 @@
+compile_commands.json
+
+*.bin
+*.elf
+
+build/
+.cache/
